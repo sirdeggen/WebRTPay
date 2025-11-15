@@ -296,9 +296,13 @@ export class WebRTCConnection {
       const cleanSDP = this.filterSDP(offer.sdp || '');
 
       if (useTrickleICE) {
-        // In trickle ICE mode, don't wait for all candidates
-        // Just include the offer SDP with no ICE candidates
-        console.log('Creating bootstrap token with trickle ICE (no candidates in QR)');
+        // In trickle ICE mode, wait for at least one ICE candidate
+        // We need at least one candidate to establish initial connection
+        // Additional candidates can be sent through data channel
+        console.log('Creating bootstrap token with trickle ICE (waiting for initial candidates)');
+
+        await this.waitForInitialICECandidate(pc, 3000);
+
         this.setState(ConnectionState.AWAITING_ANSWER);
 
         const token: BootstrapToken = {
@@ -306,7 +310,7 @@ export class WebRTCConnection {
             type: offer.type,
             sdp: cleanSDP
           },
-          iceCandidates: [], // Empty in trickle ICE mode
+          iceCandidates: this.iceCandidatesBuffer.slice(0, 2).map(c => c.toJSON()), // Include first 2 candidates
           metadata: {
             timestamp: Date.now(),
             connectionId: this.connectionId,
@@ -343,6 +347,41 @@ export class WebRTCConnection {
         error
       );
     }
+  }
+
+  /**
+   * Wait for at least one ICE candidate (for trickle ICE)
+   */
+  private waitForInitialICECandidate(
+    pc: RTCPeerConnection,
+    timeout: number
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      // If we already have a candidate, resolve immediately
+      if (this.iceCandidatesBuffer.length > 0) {
+        resolve();
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        resolve(); // Continue anyway after timeout
+      }, timeout);
+
+      // Wait for first candidate
+      const originalHandler = pc.onicecandidate;
+      const candidateHandler = (event: RTCPeerConnectionIceEvent) => {
+        if (originalHandler) {
+          originalHandler.call(pc, event);
+        }
+        if (this.iceCandidatesBuffer.length > 0) {
+          clearTimeout(timer);
+          pc.onicecandidate = originalHandler;
+          resolve();
+        }
+      };
+
+      pc.onicecandidate = candidateHandler;
+    });
   }
 
   /**

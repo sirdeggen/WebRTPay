@@ -128,19 +128,20 @@ export class ConnectionManager {
 
   /**
    * Create connection as offerer and generate QR code
-   * @param useTrickleICE - Use trickle ICE mode (single QR code, answer via data channel)
+   * Uses trickle ICE by default (single QR code, answer via data channel)
+   * @param useTrickleICE - Use trickle ICE mode (default true)
    */
-  public async createQRConnection(useTrickleICE: boolean = false): Promise<{
+  public async createQRConnection(useTrickleICE: boolean = true): Promise<{
     token: BootstrapToken;
     qrCodeDataUrl: string;
     qrCodeSVG: string;
     isTrickleICE: boolean;
   }> {
     try {
-      // Create bootstrap token (default to traditional mode with ICE candidates)
+      // Create bootstrap token with trickle ICE (includes minimal ICE candidates)
       const token = await this.connection.createBootstrapToken(useTrickleICE);
 
-      // Generate QR codes
+      // Generate QR code with offer + initial ICE candidates
       const qrCodeDataUrl = await QRBootstrap.generateQRCode(token);
       const qrCodeSVG = await QRBootstrap.generateQRCodeSVG(token);
 
