@@ -4,12 +4,13 @@
   "description": "Mobile-to-mobile WebRTC connection system for payment interactions",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "vite",
-    "preview": "vite preview",
     "lint": "eslint src --ext ts,tsx",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "demo": "cd demo && npm run dev",
+    "install-demo": "cd demo && npm install"
   },
   "keywords": [
     "webrtc",
@@ -20,19 +21,15 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "qrcode": "^1.5.3",
+    "qrcode": "^1.5.4",
     "jsqr": "^1.4.0"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
+    "@types/node": "^22.10.0",
     "@types/qrcode": "^1.5.5",
-    "@typescript-eslint/eslint-plugin": "^6.13.0",
-    "@typescript-eslint/parser": "^6.13.0",
-    "@vitejs/plugin-react": "^4.2.1",
-    "eslint": "^8.55.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "typescript": "^5.3.3",
-    "vite": "^5.0.7"
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2"
   }
 }

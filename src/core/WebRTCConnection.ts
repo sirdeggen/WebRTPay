@@ -38,8 +38,7 @@ export class WebRTCConnection {
   private connectionId: string;
 
   constructor(
-    private config: WebRTCConfig = DEFAULT_WEBRTC_CONFIG,
-    private connectionTimeout: number = 30000
+    private config: WebRTCConfig = DEFAULT_WEBRTC_CONFIG
   ) {
     this.connectionId = this.generateConnectionId();
   }

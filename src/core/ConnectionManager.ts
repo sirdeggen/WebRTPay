@@ -15,8 +15,7 @@ import {
   ConnectionEvent,
   PaymentMessage,
   ErrorType,
-  WebRTPayError,
-  ConnectionRole
+  WebRTPayError
 } from './types';
 
 /**
@@ -48,12 +47,11 @@ export interface ConnectionOptions {
 }
 
 export class ConnectionManager {
-  private connection: WebRTCConnection;
-  private protocol: MessageProtocol;
-  private remoteBootstrap?: RemoteBootstrap;
-  private config: ConnectionManagerConfig;
+  private readonly connection: WebRTCConnection;
+  private readonly protocol: MessageProtocol;
+  private readonly remoteBootstrap?: RemoteBootstrap;
+  private readonly config: ConnectionManagerConfig;
   private retryCount: number = 0;
-  private isInitialized: boolean = false;
 
   constructor(config: ConnectionManagerConfig = {}) {
     this.config = {
@@ -63,10 +61,7 @@ export class ConnectionManager {
       ...config
     };
 
-    this.connection = new WebRTCConnection(
-      config.webrtc,
-      this.config.connectionTimeout
-    );
+    this.connection = new WebRTCConnection(config.webrtc);
 
     this.protocol = new MessageProtocol();
     registerCommonSchemas(this.protocol);
@@ -100,7 +95,6 @@ export class ConnectionManager {
 
     this.connection.on(ConnectionEvent.DATA_CHANNEL_OPEN, () => {
       console.log('Data channel ready');
-      this.isInitialized = true;
 
       // Retry any queued messages
       this.protocol.retryQueuedMessages((msg) => this.sendMessage(msg));
@@ -393,7 +387,6 @@ export class ConnectionManager {
     this.connection.close();
     this.protocol.clearHistory();
     this.protocol.clearQueue();
-    this.isInitialized = false;
     this.retryCount = 0;
   }
 

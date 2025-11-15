@@ -65,6 +65,8 @@ export class RemoteBootstrap {
       const tokenWithExpiry: BootstrapToken = {
         ...token,
         metadata: {
+          timestamp: token.metadata?.timestamp || Date.now(),
+          connectionId: token.metadata?.connectionId || '',
           ...token.metadata,
           username,
           expiresAt: Date.now() + this.config.tokenValidityMs
@@ -156,7 +158,8 @@ export class RemoteBootstrap {
       }
 
       // Check if token is expired
-      if (token.metadata?.expiresAt && Date.now() > token.metadata.expiresAt) {
+      const expiresAt = token.metadata?.expiresAt as number | undefined;
+      if (expiresAt && Date.now() > expiresAt) {
         return {
           found: false
         };
