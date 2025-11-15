@@ -24,6 +24,33 @@ Or with yarn:
 yarn add webrtpay
 ```
 
+## Local Development Setup
+
+### Running the Demo with Local TURN Server
+
+WebRTPay includes a Docker Compose setup for running a local TURN server:
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/webrtpay.git
+cd webrtpay
+
+# Start TURN server and demo
+docker-compose up -d
+
+# Or start just the TURN server
+docker-compose up -d coturn
+
+# View logs
+docker-compose logs -f
+```
+
+The local TURN server runs on `localhost:3478` with credentials:
+- **Username:** `testuser`
+- **Password:** `testpass`
+
+See [TURN_SERVER_SETUP.md](TURN_SERVER_SETUP.md) for detailed configuration.
+
 ## Quick Start
 
 ### 1. Create a Connection (Device A)

@@ -210,33 +210,58 @@ const manager = createConnectionManager({
 
 ## Testing the Demo
 
-WebRTPay includes a full-featured React demo application.
+WebRTPay includes a full-featured React demo application and a local TURN server.
 
-### 1. Clone the Repository
+### Quick Start (Recommended)
+
+Using the Makefile for convenience:
 
 ```bash
+# Clone the repository
 git clone https://github.com/yourusername/webrtpay.git
 cd webrtpay
+
+# One command to set everything up
+make quickstart
+
+# Then start development
+make dev
 ```
 
-### 2. Install Dependencies
+### Manual Setup
+
+If you prefer to run commands manually:
 
 ```bash
-# Root dependencies
-npm install
+# 1. Clone the repository
+git clone https://github.com/yourusername/webrtpay.git
+cd webrtpay
 
-# Demo dependencies
+# 2. Install dependencies
+npm install
+cd demo && npm install && cd ..
+
+# 3. Start local TURN server (optional but recommended)
+docker-compose up -d coturn
+
+# 4. Run the demo
 cd demo
-npm install
-```
-
-### 3. Run the Demo
-
-```bash
 npm run dev
 ```
 
 Open http://localhost:3000 in two browser tabs or on two devices.
+
+### Available Make Commands
+
+```bash
+make help          # Show all available commands
+make dev           # Run demo
+make turn-up       # Start TURN server
+make turn-down     # Stop TURN server
+make turn-logs     # View TURN logs
+make docker-up     # Start everything
+make clean         # Clean build artifacts
+```
 
 ### 4. Test Connection
 

@@ -7,3 +7,10 @@ dist
 coverage
 .vscode
 .idea
+
+# Docker
+docker-compose.override.yml
+
+# TURN server logs
+turnserver.log
+turndb
