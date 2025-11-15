@@ -1,11 +1,13 @@
 /**
  * QR-based local bootstrapping system
  * Handles QR code generation and scanning for peer discovery
+ *
+ * Now simplified to encode/decode TXID strings for BSV Overlay Services signaling
  */
 
 import QRCode from 'qrcode';
-import jsQR from 'jsqr';
-import { BootstrapToken, ErrorType, WebRTPayError } from '../core/types';
+import QrScanner from 'qr-scanner';
+import { ErrorType, WebRTPayError } from '../core/types';
 
 /**
  * QR code generation options
@@ -29,8 +31,8 @@ export interface QRCodeOptions {
  */
 const DEFAULT_QR_OPTIONS: QRCodeOptions = {
   errorCorrectionLevel: 'M',
-  width: 300,
-  margin: 2,
+  width: 512,
+  margin: 4,
   color: {
     dark: '#000000',
     light: '#FFFFFF'
@@ -39,72 +41,18 @@ const DEFAULT_QR_OPTIONS: QRCodeOptions = {
 
 export class QRBootstrap {
   /**
-   * Compress bootstrap token for QR code
-   * Removes unnecessary whitespace and optimizes payload size
-   */
-  private static compressToken(token: BootstrapToken): string {
-    // Create minimal JSON representation
-    const compressed = {
-      o: token.offer,
-      i: token.iceCandidates || [],
-      m: token.metadata
-    };
-    return JSON.stringify(compressed);
-  }
-
-  /**
-   * Decompress bootstrap token from QR code
-   */
-  private static decompressToken(compressed: string): BootstrapToken {
-    try {
-      const parsed = JSON.parse(compressed);
-
-      // Handle both compressed and uncompressed formats
-      if (parsed.o && parsed.i !== undefined && parsed.m) {
-        return {
-          offer: parsed.o,
-          iceCandidates: parsed.i,
-          metadata: parsed.m
-        };
-      }
-
-      // Fallback to uncompressed format
-      if (parsed.offer) {
-        return parsed as BootstrapToken;
-      }
-
-      throw new Error('Invalid token format');
-    } catch (error) {
-      throw new WebRTPayError(
-        ErrorType.BOOTSTRAP_PARSE_FAILED,
-        'Failed to parse bootstrap token from QR code',
-        error
-      );
-    }
-  }
-
-  /**
-   * Generate QR code as data URL from bootstrap token
+   * Generate QR code as data URL from a TXID string
    * Returns a base64-encoded PNG image
    */
   public static async generateQRCode(
-    token: BootstrapToken,
+    txid: string,
     options: QRCodeOptions = {}
   ): Promise<string> {
     try {
-      const compressed = this.compressToken(token);
+      console.log('Generating QR code for TXID:', txid);
       const mergedOptions = { ...DEFAULT_QR_OPTIONS, ...options };
 
-      // Check payload size and warn if too large
-      const sizeKb = new Blob([compressed]).size / 1024;
-      if (sizeKb > 2) {
-        console.warn(
-          `QR code payload is ${sizeKb.toFixed(2)}KB. ` +
-          'Consider reducing ICE candidates for better scanability.'
-        );
-      }
-
-      const dataUrl = await QRCode.toDataURL(compressed, mergedOptions);
+      const dataUrl = await QRCode.toDataURL(txid, mergedOptions);
       return dataUrl;
     } catch (error) {
       throw new WebRTPayError(
@@ -116,18 +64,17 @@ export class QRBootstrap {
   }
 
   /**
-   * Generate QR code as SVG string
+   * Generate QR code as SVG string from a TXID
    * Useful for vector graphics in web applications
    */
   public static async generateQRCodeSVG(
-    token: BootstrapToken,
+    txid: string,
     options: QRCodeOptions = {}
   ): Promise<string> {
     try {
-      const compressed = this.compressToken(token);
       const mergedOptions = { ...DEFAULT_QR_OPTIONS, ...options };
 
-      const svg = await QRCode.toString(compressed, {
+      const svg = await QRCode.toString(txid, {
         ...mergedOptions,
         type: 'svg'
       });
@@ -142,31 +89,51 @@ export class QRBootstrap {
   }
 
   /**
-   * Scan QR code from image data
-   * Extracts bootstrap token from QR code
+   * Create and start a QR scanner on a video element
+   * Returns scanner instance that must be stopped and destroyed when done
+   * Scans for TXID strings
    */
-  public static scanQRCode(
-    imageData: ImageData
-  ): BootstrapToken | null {
+  public static async createScanner(
+    videoElement: HTMLVideoElement,
+    onScan: (txid: string) => void,
+    onError?: (error: Error) => void
+  ): Promise<QrScanner> {
     try {
-      const code = jsQR(
-        imageData.data,
-        imageData.width,
-        imageData.height,
+      // Check if camera is available
+      const hasCamera = await QrScanner.hasCamera();
+      if (!hasCamera) {
+        throw new WebRTPayError(
+          ErrorType.BOOTSTRAP_PARSE_FAILED,
+          'No camera available on this device'
+        );
+      }
+
+      const scanner = new QrScanner(
+        videoElement,
+        (result) => {
+          try {
+            console.log('QR Scanner: TXID received:', result.data);
+            onScan(result.data);
+          } catch (error) {
+            console.error('QR Scanner: Error processing scan:', error);
+            if (onError) {
+              onError(error as Error);
+            }
+          }
+        },
         {
-          inversionAttempts: 'dontInvert'
+          highlightScanRegion: true,
+          highlightCodeOutline: true,
+          maxScansPerSecond: 5
         }
       );
 
-      if (!code) {
-        return null;
-      }
-
-      return this.decompressToken(code.data);
+      await scanner.start();
+      return scanner;
     } catch (error) {
       throw new WebRTPayError(
         ErrorType.BOOTSTRAP_PARSE_FAILED,
-        'Failed to scan QR code',
+        'Failed to start QR scanner',
         error
       );
     }
@@ -174,136 +141,97 @@ export class QRBootstrap {
 
   /**
    * Scan QR code from video stream
-   * Continuously attempts to scan until a valid code is found or timeout
+   * Continuously attempts to scan until a valid TXID is found or timeout
    */
   public static async scanQRCodeFromVideo(
     videoElement: HTMLVideoElement,
     timeoutMs: number = 30000
-  ): Promise<BootstrapToken> {
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
+      let scanner: QrScanner | null = null;
 
-      if (!ctx) {
-        reject(new WebRTPayError(
-          ErrorType.BOOTSTRAP_PARSE_FAILED,
-          'Failed to create canvas context'
-        ));
-        return;
-      }
-
-      const startTime = Date.now();
-      let animationFrame: number;
-
-      const scan = () => {
-        if (Date.now() - startTime > timeoutMs) {
-          cancelAnimationFrame(animationFrame);
-          reject(new WebRTPayError(
-            ErrorType.TIMEOUT,
-            'QR code scan timeout'
-          ));
-          return;
+      const cleanup = () => {
+        if (scanner) {
+          scanner.stop();
+          scanner.destroy();
+          scanner = null;
         }
-
-        if (videoElement.readyState === videoElement.HAVE_ENOUGH_DATA) {
-          canvas.width = videoElement.videoWidth;
-          canvas.height = videoElement.videoHeight;
-          ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-
-          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-          try {
-            const token = this.scanQRCode(imageData);
-            if (token) {
-              cancelAnimationFrame(animationFrame);
-              resolve(token);
-              return;
-            }
-          } catch (error) {
-            // Continue scanning on parse errors
-            console.debug('QR scan attempt failed, retrying...');
-          }
-        }
-
-        animationFrame = requestAnimationFrame(scan);
       };
 
-      scan();
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new WebRTPayError(
+          ErrorType.TIMEOUT,
+          'QR code scan timeout'
+        ));
+      }, timeoutMs);
+
+      this.createScanner(
+        videoElement,
+        (txid) => {
+          clearTimeout(timeoutId);
+          cleanup();
+          resolve(txid);
+        },
+        (error) => {
+          // Continue scanning on parse errors
+          console.debug('QR scan attempt failed, retrying...', error);
+        }
+      ).then(s => {
+        scanner = s;
+      }).catch(error => {
+        clearTimeout(timeoutId);
+        reject(error);
+      });
     });
   }
 
   /**
-   * Request camera access and start video stream
-   * Returns video element ready for QR scanning
+   * Stop and destroy a QR scanner
    */
-  public static async setupCamera(
-    facingMode: 'user' | 'environment' = 'environment'
-  ): Promise<{ video: HTMLVideoElement; stream: MediaStream }> {
+  public static stopScanner(scanner: QrScanner): void {
+    scanner.stop();
+    scanner.destroy();
+  }
+
+  /**
+   * Check if camera is available on this device
+   */
+  public static async hasCameraSupport(): Promise<boolean> {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode,
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: false
-      });
+      return await QrScanner.hasCamera();
+    } catch {
+      return false;
+    }
+  }
 
-      const video = document.createElement('video');
-      video.srcObject = stream;
-      video.setAttribute('playsinline', 'true');
-      video.play();
-
-      return { video, stream };
+  /**
+   * List available cameras
+   */
+  public static async listCameras(): Promise<QrScanner.Camera[]> {
+    try {
+      return await QrScanner.listCameras(true);
     } catch (error) {
       throw new WebRTPayError(
         ErrorType.BOOTSTRAP_PARSE_FAILED,
-        'Failed to access camera',
+        'Failed to list cameras',
         error
       );
     }
   }
 
   /**
-   * Stop camera stream and cleanup
+   * Estimate QR code payload size in bytes for a TXID string
    */
-  public static stopCamera(stream: MediaStream): void {
-    stream.getTracks().forEach(track => track.stop());
+  public static estimatePayloadSize(txid: string): number {
+    return new Blob([txid]).size;
   }
 
   /**
-   * Estimate QR code payload size in bytes
+   * Validate TXID format (basic check for hex string)
    */
-  public static estimatePayloadSize(token: BootstrapToken): number {
-    const compressed = this.compressToken(token);
-    return new Blob([compressed]).size;
-  }
-
-  /**
-   * Validate bootstrap token structure
-   */
-  public static validateToken(token: BootstrapToken): boolean {
-    return !!(
-      token &&
-      token.offer &&
-      token.offer.type &&
-      token.offer.sdp &&
-      token.metadata &&
-      token.metadata.timestamp &&
-      token.metadata.connectionId
-    );
-  }
-
-  /**
-   * Check if token is expired
-   */
-  public static isTokenExpired(
-    token: BootstrapToken,
-    maxAgeMs: number = 300000 // 5 minutes default
-  ): boolean {
-    if (!token.metadata || !token.metadata.timestamp) {
-      return true;
-    }
-    return Date.now() - token.metadata.timestamp > maxAgeMs;
+  public static validateTxid(txid: string): boolean {
+    // Basic validation: check if it's a valid hex string of reasonable length
+    return /^[a-fA-F0-9]{64}$/.test(txid);
   }
 }

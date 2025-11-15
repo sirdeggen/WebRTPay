@@ -128,15 +128,17 @@ export class ConnectionManager {
 
   /**
    * Create connection as offerer and generate QR code
+   * @param useTrickleICE - Use trickle ICE mode (single QR code, answer via data channel)
    */
-  public async createQRConnection(): Promise<{
+  public async createQRConnection(useTrickleICE: boolean = false): Promise<{
     token: BootstrapToken;
     qrCodeDataUrl: string;
     qrCodeSVG: string;
+    isTrickleICE: boolean;
   }> {
     try {
-      // Create bootstrap token
-      const token = await this.connection.createBootstrapToken();
+      // Create bootstrap token (default to traditional mode with ICE candidates)
+      const token = await this.connection.createBootstrapToken(useTrickleICE);
 
       // Generate QR codes
       const qrCodeDataUrl = await QRBootstrap.generateQRCode(token);
@@ -145,7 +147,8 @@ export class ConnectionManager {
       return {
         token,
         qrCodeDataUrl,
-        qrCodeSVG
+        qrCodeSVG,
+        isTrickleICE: useTrickleICE
       };
     } catch (error) {
       throw new WebRTPayError(
@@ -158,8 +161,20 @@ export class ConnectionManager {
 
   /**
    * Join connection by scanning QR code
+   * In trickle ICE mode, returns null (answer sent via data channel)
+   * In traditional mode, returns answer QR code that needs to be shown to the offerer
    */
-  public async joinQRConnection(token: BootstrapToken): Promise<void> {
+  public async joinQRConnection(token: BootstrapToken): Promise<{
+    answer: RTCSessionDescriptionInit;
+    iceCandidates: RTCIceCandidateInit[];
+    answerQRCode: string;
+    isTrickleICE: boolean;
+  } | {
+    isTrickleICE: boolean;
+    answer?: never;
+    iceCandidates?: never;
+    answerQRCode?: never;
+  }> {
     try {
       // Validate token
       if (!QRBootstrap.validateToken(token)) {
@@ -177,9 +192,43 @@ export class ConnectionManager {
         );
       }
 
-      // Connect using token
-      await this.connection.connectWithBootstrapToken(token);
+      // Connect using token and get answer (if not trickle ICE)
+      console.log('>>> joinQRConnection: calling connectWithBootstrapToken');
+      const result = await this.connection.connectWithBootstrapToken(token);
+      console.log('>>> joinQRConnection: result from connectWithBootstrapToken:', result);
+
+      if (result === null) {
+        // Trickle ICE mode - answer will be sent via data channel
+        console.log('>>> Trickle ICE mode detected');
+        return {
+          isTrickleICE: true
+        };
+      } else {
+        // Traditional mode - generate QR code for the answer
+        console.log('>>> Traditional mode: generating answer QR');
+        const { answer, iceCandidates } = result;
+        console.log('>>> Answer:', answer);
+        console.log('>>> ICE candidates:', iceCandidates);
+
+        const answerToken = {
+          a: answer,
+          i: iceCandidates
+        };
+        console.log('>>> Answer token to encode:', answerToken);
+
+        const answerQRCode = await QRBootstrap.generateQRCode(answerToken as any);
+        console.log('>>> Answer QR code generated');
+
+        return {
+          answer,
+          iceCandidates,
+          answerQRCode,
+          isTrickleICE: false
+        };
+      }
     } catch (error) {
+      console.error('>>> ERROR in joinQRConnection:', error);
+      console.error('>>> Error details:', (error as any).message, (error as any).stack);
       throw new WebRTPayError(
         ErrorType.CONNECTION_FAILED,
         'Failed to join QR connection',
@@ -189,22 +238,18 @@ export class ConnectionManager {
   }
 
   /**
-   * Scan QR code from video and join connection
+   * Complete QR connection by scanning answer (offerer side)
    */
-  public async scanAndJoin(
-    videoElement: HTMLVideoElement,
-    timeoutMs?: number
-  ): Promise<void> {
+  public async completeQRConnection(answerToken: {
+    a: RTCSessionDescriptionInit;
+    i: RTCIceCandidateInit[];
+  }): Promise<void> {
     try {
-      const token = await QRBootstrap.scanQRCodeFromVideo(
-        videoElement,
-        timeoutMs
-      );
-      await this.joinQRConnection(token);
+      await this.connection.receiveAnswer(answerToken.a, answerToken.i);
     } catch (error) {
       throw new WebRTPayError(
-        ErrorType.BOOTSTRAP_PARSE_FAILED,
-        'Failed to scan and join connection',
+        ErrorType.CONNECTION_FAILED,
+        'Failed to complete QR connection',
         error
       );
     }

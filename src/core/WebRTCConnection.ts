@@ -36,6 +36,8 @@ export class WebRTCConnection {
   private eventListeners: Map<ConnectionEvent, Set<EventListener<any>>> = new Map();
   private iceCandidatesBuffer: RTCIceCandidate[] = [];
   private connectionId: string;
+  private trickleIceEnabled: boolean = false;
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
 
   constructor(
     private config: WebRTCConfig = DEFAULT_WEBRTC_CONFIG
@@ -48,6 +50,17 @@ export class WebRTCConnection {
    */
   private generateConnectionId(): string {
     return `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  /**
+   * Filter problematic SDP attributes for cross-browser compatibility
+   */
+  private filterSDP(sdp: string): string {
+    return sdp
+      .split('\n')
+      .filter(line => !line.startsWith('a=max-message-size:'))
+      .filter(line => !line.startsWith('a=sctp-port:'))
+      .join('\n');
   }
 
   /**
@@ -134,6 +147,14 @@ export class WebRTCConnection {
       if (event.candidate) {
         this.iceCandidatesBuffer.push(event.candidate);
         this.emit(ConnectionEvent.ICE_CANDIDATE, { candidate: event.candidate });
+
+        // In trickle ICE mode, send candidates through data channel as they arrive
+        if (this.trickleIceEnabled && this.dataChannel && this.dataChannel.readyState === 'open') {
+          this.sendIceCandidateThroughDataChannel(event.candidate);
+        } else if (this.trickleIceEnabled) {
+          // Queue candidate to send when data channel opens
+          this.pendingIceCandidates.push(event.candidate.toJSON());
+        }
       }
     };
 
@@ -193,6 +214,11 @@ export class WebRTCConnection {
     channel.onopen = () => {
       console.log('Data channel opened');
       this.emit(ConnectionEvent.DATA_CHANNEL_OPEN, { channel });
+
+      // If we're the answerer in trickle ICE mode, send answer through data channel
+      if (this.trickleIceEnabled && this.role === ConnectionRole.ANSWERER && this.peerConnection) {
+        this.sendAnswerThroughDataChannel();
+      }
     };
 
     channel.onclose = () => {
@@ -214,7 +240,14 @@ export class WebRTCConnection {
     channel.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        this.emit(ConnectionEvent.MESSAGE_RECEIVED, { data });
+
+        // Check if this is a signaling message (answer or ICE candidate)
+        if (data.__signaling) {
+          this.handleSignalingMessage(data);
+        } else {
+          // Regular application message
+          this.emit(ConnectionEvent.MESSAGE_RECEIVED, { data });
+        }
       } catch (error) {
         console.error('Failed to parse message:', error);
         this.emit(ConnectionEvent.ERROR, {
@@ -229,12 +262,21 @@ export class WebRTCConnection {
   }
 
   /**
+   * Enable trickle ICE mode for this connection
+   */
+  public enableTrickleICE(): void {
+    this.trickleIceEnabled = true;
+  }
+
+  /**
    * Create bootstrap token as offerer
    * This generates the QR code payload or remote broadcast token
+   * In trickle ICE mode, includes minimal or no ICE candidates
    */
-  public async createBootstrapToken(): Promise<BootstrapToken> {
+  public async createBootstrapToken(useTrickleICE: boolean = false): Promise<BootstrapToken> {
     try {
       this.role = ConnectionRole.OFFERER;
+      this.trickleIceEnabled = useTrickleICE;
       this.setState(ConnectionState.CREATING_OFFER);
 
       const pc = this.initializePeerConnection();
@@ -250,24 +292,49 @@ export class WebRTCConnection {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering to complete or timeout
-      await this.waitForICEGathering(pc, 5000);
+      // Filter problematic SDP attributes for compatibility
+      const cleanSDP = this.filterSDP(offer.sdp || '');
 
-      this.setState(ConnectionState.AWAITING_ANSWER);
+      if (useTrickleICE) {
+        // In trickle ICE mode, don't wait for all candidates
+        // Just include the offer SDP with no ICE candidates
+        console.log('Creating bootstrap token with trickle ICE (no candidates in QR)');
+        this.setState(ConnectionState.AWAITING_ANSWER);
 
-      const token: BootstrapToken = {
-        offer: {
-          type: offer.type,
-          sdp: offer.sdp
-        },
-        iceCandidates: this.iceCandidatesBuffer.map(c => c.toJSON()),
-        metadata: {
-          timestamp: Date.now(),
-          connectionId: this.connectionId
-        }
-      };
+        const token: BootstrapToken = {
+          offer: {
+            type: offer.type,
+            sdp: cleanSDP
+          },
+          iceCandidates: [], // Empty in trickle ICE mode
+          metadata: {
+            timestamp: Date.now(),
+            connectionId: this.connectionId,
+            trickleIce: true
+          }
+        };
 
-      return token;
+        return token;
+      } else {
+        // Traditional mode: wait for ICE gathering to complete or timeout
+        await this.waitForICEGathering(pc, 5000);
+
+        this.setState(ConnectionState.AWAITING_ANSWER);
+
+        const token: BootstrapToken = {
+          offer: {
+            type: offer.type,
+            sdp: cleanSDP
+          },
+          iceCandidates: this.iceCandidatesBuffer.map(c => c.toJSON()),
+          metadata: {
+            timestamp: Date.now(),
+            connectionId: this.connectionId
+          }
+        };
+
+        return token;
+      }
     } catch (error) {
       this.setState(ConnectionState.FAILED);
       throw new WebRTPayError(
@@ -311,18 +378,28 @@ export class WebRTCConnection {
   /**
    * Connect using bootstrap token as answerer
    * This is called when scanning QR or receiving remote token
+   * In trickle ICE mode, answer is sent through data channel
+   * In traditional mode, returns answer that needs to be sent back to offerer
    */
-  public async connectWithBootstrapToken(token: BootstrapToken): Promise<void> {
+  public async connectWithBootstrapToken(token: BootstrapToken): Promise<{
+    answer: RTCSessionDescriptionInit;
+    iceCandidates: RTCIceCandidateInit[];
+  } | null> {
     try {
       this.role = ConnectionRole.ANSWERER;
+      const isTrickleIce = token.metadata?.trickleIce === true;
+      this.trickleIceEnabled = isTrickleIce;
       this.setState(ConnectionState.CONNECTING);
+
+      // Clear previous ICE candidates
+      this.iceCandidatesBuffer = [];
 
       const pc = this.initializePeerConnection();
 
       // Set remote description from offer
       await pc.setRemoteDescription(new RTCSessionDescription(token.offer));
 
-      // Add ICE candidates if provided
+      // Add ICE candidates if provided (traditional mode)
       if (token.iceCandidates && token.iceCandidates.length > 0) {
         for (const candidate of token.iceCandidates) {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -333,11 +410,38 @@ export class WebRTCConnection {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      // In a real implementation, the answer would need to be sent back
-      // via the same mechanism (QR scan response or remote service)
-      // For this spec, we assume the answerer can communicate back
+      console.log('>>> Answer created:', answer);
+      console.log('>>> Trickle ICE mode:', isTrickleIce);
 
+      if (isTrickleIce) {
+        // In trickle ICE mode, answer will be sent through data channel when it opens
+        // We don't need to return it
+        console.log('Using trickle ICE - answer will be sent via data channel');
+        return null;
+      } else {
+        // Traditional mode: wait for ICE gathering and return answer
+        console.log('>>> Traditional mode: waiting for ICE gathering...');
+        await this.waitForICEGathering(pc, 5000);
+
+        console.log('>>> ICE candidates buffer:', this.iceCandidatesBuffer.length);
+        const candidates = this.iceCandidatesBuffer.slice(0, 3).map(c => c.toJSON());
+        console.log('>>> Returning candidates:', candidates.length);
+
+        const result = {
+          answer: {
+            type: answer.type,
+            sdp: answer.sdp
+          },
+          iceCandidates: candidates
+        };
+
+        console.log('>>> connectWithBootstrapToken returning:', result);
+        return result;
+      }
     } catch (error) {
+      console.error('>>> ERROR in connectWithBootstrapToken:', error);
+      console.error('>>> Error type:', (error as any).constructor.name);
+      console.error('>>> Error message:', (error as any).message);
       this.setState(ConnectionState.FAILED);
       throw new WebRTPayError(
         ErrorType.CONNECTION_FAILED,
@@ -350,8 +454,17 @@ export class WebRTCConnection {
   /**
    * Complete connection by receiving answer (offerer side)
    */
-  public async receiveAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
+  public async receiveAnswer(
+    answer: RTCSessionDescriptionInit,
+    iceCandidates?: RTCIceCandidateInit[]
+  ): Promise<void> {
+    console.log('>>> receiveAnswer called');
+    console.log('>>> Role:', this.role);
+    console.log('>>> Answer:', answer);
+    console.log('>>> ICE candidates:', iceCandidates?.length || 0);
+
     if (this.role !== ConnectionRole.OFFERER) {
+      console.error('>>> ERROR: Not offerer role!');
       throw new WebRTPayError(
         ErrorType.CONNECTION_FAILED,
         'Only offerer can receive answer'
@@ -359,6 +472,7 @@ export class WebRTCConnection {
     }
 
     if (!this.peerConnection) {
+      console.error('>>> ERROR: No peer connection!');
       throw new WebRTPayError(
         ErrorType.CONNECTION_FAILED,
         'No peer connection initialized'
@@ -366,11 +480,28 @@ export class WebRTCConnection {
     }
 
     try {
+      console.log('>>> Setting remote description...');
       await this.peerConnection.setRemoteDescription(
         new RTCSessionDescription(answer)
       );
+      console.log('>>> Remote description set successfully');
+
+      // Add answerer's ICE candidates if provided
+      if (iceCandidates && iceCandidates.length > 0) {
+        console.log(`>>> Adding ${iceCandidates.length} ICE candidates...`);
+        for (const candidate of iceCandidates) {
+          await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+          console.log('>>> ICE candidate added');
+        }
+      } else {
+        console.log('>>> No ICE candidates to add');
+      }
+
+      console.log('>>> Setting state to CONNECTING');
       this.setState(ConnectionState.CONNECTING);
+      console.log('>>> receiveAnswer completed successfully');
     } catch (error) {
+      console.error('>>> ERROR in receiveAnswer:', error);
       this.setState(ConnectionState.FAILED);
       throw new WebRTPayError(
         ErrorType.CONNECTION_FAILED,
@@ -378,6 +509,92 @@ export class WebRTCConnection {
         error
       );
     }
+  }
+
+  /**
+   * Handle signaling messages received through data channel
+   */
+  private async handleSignalingMessage(message: any): Promise<void> {
+    console.log('Received signaling message:', message.type);
+
+    try {
+      if (message.type === 'answer') {
+        // Offerer receives answer from answerer
+        await this.peerConnection?.setRemoteDescription(
+          new RTCSessionDescription(message.answer)
+        );
+        console.log('Remote answer set');
+      } else if (message.type === 'ice-candidate') {
+        // Received ICE candidate
+        if (message.candidate && this.peerConnection) {
+          await this.peerConnection.addIceCandidate(
+            new RTCIceCandidate(message.candidate)
+          );
+          console.log('Remote ICE candidate added');
+        }
+      }
+    } catch (error) {
+      console.error('Failed to handle signaling message:', error);
+      this.emit(ConnectionEvent.ERROR, {
+        error: new WebRTPayError(
+          ErrorType.CONNECTION_FAILED,
+          'Failed to handle signaling message',
+          error
+        )
+      });
+    }
+  }
+
+  /**
+   * Send answer through data channel (answerer side in trickle ICE)
+   */
+  private async sendAnswerThroughDataChannel(): Promise<void> {
+    if (!this.dataChannel || !this.peerConnection) {
+      return;
+    }
+
+    const localDesc = this.peerConnection.localDescription;
+    if (!localDesc) {
+      return;
+    }
+
+    console.log('Sending answer through data channel');
+
+    // Send answer
+    this.dataChannel.send(JSON.stringify({
+      __signaling: true,
+      type: 'answer',
+      answer: {
+        type: localDesc.type,
+        sdp: localDesc.sdp
+      }
+    }));
+
+    // Send any pending ICE candidates
+    for (const candidate of this.pendingIceCandidates) {
+      this.dataChannel.send(JSON.stringify({
+        __signaling: true,
+        type: 'ice-candidate',
+        candidate
+      }));
+    }
+    this.pendingIceCandidates = [];
+  }
+
+  /**
+   * Send ICE candidate through data channel
+   */
+  private sendIceCandidateThroughDataChannel(candidate: RTCIceCandidate): void {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      return;
+    }
+
+    console.log('Sending ICE candidate through data channel');
+    this.dataChannel.send(JSON.stringify({
+      __signaling: true,
+      type: 'ice-candidate',
+      candidate: candidate.toJSON()
+    }));
   }
 
   /**

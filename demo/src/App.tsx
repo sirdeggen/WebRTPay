@@ -22,16 +22,19 @@ function App() {
     ConnectionState.IDLE
   );
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
+  const [answerQRCodeUrl, setAnswerQRCodeUrl] = useState<string>('');
+  const [waitingForAnswer, setWaitingForAnswer] = useState(false);
   const [username, setUsername] = useState<string>('');
   const [remoteUsername, setRemoteUsername] = useState<string>('');
   const [messages, setMessages] = useState<PaymentMessage[]>([]);
   const [messageInput, setMessageInput] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [isScanning, setIsScanning] = useState(false);
+  const [scannerReady, setScannerReady] = useState(false);
   const [stats, setStats] = useState({ sent: 0, received: 0 });
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const scannerRef = useRef<any>(null);
 
   // Check WebRTC support on mount
   useEffect(() => {
@@ -53,12 +56,6 @@ function App() {
       connectionTimeout: 30000,
       autoRetry: true,
       maxRetries: 3,
-      // Remote configuration (optional - would need actual server URLs)
-      // remote: {
-      //   broadcasterUrl: 'https://your-broadcaster.example.com',
-      //   lookupUrl: 'https://your-lookup.example.com',
-      //   tokenValidityMs: 300000
-      // }
     });
 
     // Setup event listeners
@@ -81,54 +78,143 @@ function App() {
     return newManager;
   };
 
-  // Create QR connection
+  // Create QR connection (Step 1: Offerer generates QR)
   const handleCreateQR = async () => {
     try {
       setError('');
       const mgr = initializeManager();
 
-      const { qrCodeDataUrl } = await mgr.createQRConnection();
+      // Use traditional two QR code mode (false = no trickle ICE)
+      const { qrCodeDataUrl, token, isTrickleICE } = await mgr.createQRConnection(false);
       setQrCodeUrl(qrCodeDataUrl);
+      setWaitingForAnswer(true); // Always wait for answer in traditional mode
+
+      // Log payload size for debugging
+      const payloadSize = QRBootstrap.estimatePayloadSize(token);
+      console.log(`QR code payload size: ${payloadSize} bytes (${(payloadSize / 1024).toFixed(2)} KB)`);
+      console.log(`ICE candidates included: ${token.iceCandidates?.length || 0}`);
+      console.log(`Traditional mode (two QR codes): ${!isTrickleICE}`);
     } catch (err) {
       setError((err as Error).message);
     }
   };
 
-  // Start scanning QR code
-  const handleStartScan = async () => {
-    try {
-      setError('');
-      setIsScanning(true);
+  // Start scanning QR code (Step 2: Answerer scans offer QR)
+  const handleStartScan = () => {
+    setError('');
+    setIsScanning(true);
+  };
 
-      const { video, stream } = await QRBootstrap.setupCamera('environment');
-      streamRef.current = stream;
+  // Start scanning answer QR code (Step 3: Offerer scans answer QR)
+  const handleScanAnswer = () => {
+    setError('');
+    setWaitingForAnswer(false);
+    setIsScanning(true);
+  };
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
+  // Initialize scanner when video element is ready
+  useEffect(() => {
+    if (!isScanning || !videoRef.current || scannerRef.current) {
+      console.log('Scanner init skipped:', { isScanning, hasVideo: !!videoRef.current, hasScanner: !!scannerRef.current });
+      return;
+    }
+
+    console.log('Initializing scanner...');
+    let mounted = true;
+
+    const initScanner = async () => {
+      try {
+        console.log('Creating scanner on video element');
+
+        // Create scanner with callbacks
+        const scanner = await QRBootstrap.createScanner(
+          videoRef.current!,
+          async (data) => {
+            if (!mounted) return;
+            console.log('========================================');
+            console.log('QR code scanned successfully!');
+            console.log('Data type:', typeof data);
+            console.log('Data keys:', Object.keys(data));
+            console.log('Full data:', JSON.stringify(data, null, 2));
+            console.log('Has "a" key:', 'a' in data);
+            console.log('Has "i" key:', 'i' in data);
+            console.log('Has "offer" key:', 'offer' in data);
+            console.log('========================================');
+
+            // Successfully scanned
+            stopScanner();
+
+            try {
+              // Check if this is an answer QR code or offer QR code
+              if ('a' in data && 'i' in data) {
+                // This is an answer QR code (Step 3)
+                console.log('>>> DETECTED: Answer QR code');
+                console.log('>>> Manager exists:', !!manager);
+                if (manager) {
+                  console.log('>>> Calling completeQRConnection...');
+                  await manager.completeQRConnection(data as any);
+                  console.log('>>> completeQRConnection completed successfully');
+                } else {
+                  console.error('>>> ERROR: No manager available!');
+                  setError('Connection manager not initialized');
+                }
+              } else {
+                // This is an offer QR code (Step 2)
+                console.log('>>> DETECTED: Offer QR code');
+                const mgr = manager || initializeManager();
+                const result = await mgr.joinQRConnection(data);
+
+                // Always show answer QR code in traditional mode
+                console.log('>>> Showing answer QR code');
+                if (result.answerQRCode) {
+                  setAnswerQRCodeUrl(result.answerQRCode);
+                } else {
+                  setError('Failed to generate answer QR code');
+                }
+              }
+            } catch (err) {
+              console.error('>>> ERROR during QR processing:', err);
+              setError((err as Error).message);
+            }
+          },
+          (error) => {
+            console.error('Scan error:', error);
+            // Continue scanning on errors
+          }
+        );
+
+        if (mounted) {
+          console.log('Scanner created successfully');
+          scannerRef.current = scanner;
+          setScannerReady(true);
+        } else {
+          scanner.stop();
+          scanner.destroy();
+        }
+      } catch (err) {
+        console.error('Failed to initialize scanner:', err);
+        if (mounted) {
+          setError((err as Error).message);
+          setIsScanning(false);
+        }
       }
+    };
 
-      const mgr = initializeManager();
-      await mgr.scanAndJoin(video, 30000);
+    initScanner();
 
-      // Stop camera after successful scan
-      stopCamera();
-      setIsScanning(false);
-    } catch (err) {
-      setError((err as Error).message);
-      stopCamera();
-      setIsScanning(false);
-    }
-  };
+    return () => {
+      mounted = false;
+    };
+  }, [isScanning, manager]);
 
-  // Stop camera
-  const stopCamera = () => {
-    if (streamRef.current) {
-      QRBootstrap.stopCamera(streamRef.current);
-      streamRef.current = null;
+  // Stop scanner
+  const stopScanner = () => {
+    if (scannerRef.current) {
+      QRBootstrap.stopScanner(scannerRef.current);
+      scannerRef.current = null;
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    setIsScanning(false);
+    setScannerReady(false);
   };
 
   // Create remote connection
@@ -211,9 +297,11 @@ function App() {
     }
     setConnectionState(ConnectionState.IDLE);
     setQrCodeUrl('');
+    setAnswerQRCodeUrl('');
+    setWaitingForAnswer(false);
     setMessages([]);
     setStats({ sent: 0, received: 0 });
-    stopCamera();
+    stopScanner();
   };
 
   // Cleanup on unmount
@@ -222,7 +310,7 @@ function App() {
       if (manager) {
         manager.close();
       }
-      stopCamera();
+      stopScanner();
     };
   }, [manager]);
 
@@ -337,20 +425,41 @@ function App() {
           </>
         )}
 
-        {connectionState !== ConnectionState.IDLE && (
+        {connectionState !== ConnectionState.IDLE && !answerQRCodeUrl && !waitingForAnswer && (
           <button className="button secondary" onClick={handleClose}>
             Close Connection
           </button>
         )}
       </div>
 
-      {/* QR Code Display */}
-      {qrCodeUrl && (
+      {/* Offer QR Code Display (Step 1) */}
+      {qrCodeUrl && !answerQRCodeUrl && (
         <div className="card">
-          <h2>QR Code</h2>
+          <h2>Step 1: Show QR Code</h2>
           <div className="qr-container">
             <img src={qrCodeUrl} alt="QR Code" className="qr-code" />
-            <p className="info-text">Scan this code with another device</p>
+            <p className="info-text">
+              Have the other device scan this code
+            </p>
+          </div>
+          <p className="info-text">
+            After they scan, they'll show you a QR code. Click below when ready to scan it.
+          </p>
+          <button className="button" onClick={handleScanAnswer}>
+            Scan Their Answer QR Code
+          </button>
+        </div>
+      )}
+
+      {/* Answer QR Code Display (Step 2) */}
+      {answerQRCodeUrl && (
+        <div className="card">
+          <h2>Step 2: Show This Answer QR Code</h2>
+          <div className="qr-container">
+            <img src={answerQRCodeUrl} alt="Answer QR Code" className="qr-code" />
+            <p className="info-text">
+              Show this code to the other device to complete the connection
+            </p>
           </div>
         </div>
       )}
@@ -358,14 +467,42 @@ function App() {
       {/* Video Scanner */}
       {isScanning && (
         <div className="card">
-          <h2>Scanning...</h2>
-          <div className="video-container">
-            <video ref={videoRef} className="video" autoPlay playsInline />
+          <h2>
+            {scannerReady ? 'Scanning QR Code...' : 'Initializing Camera...'}
+          </h2>
+          <div className="video-container" style={{ position: 'relative' }}>
+            <video
+              ref={videoRef}
+              className="video"
+              autoPlay
+              playsInline
+              muted
+              style={{ width: '100%', maxWidth: '100%', display: 'block' }}
+            />
+            {!scannerReady && (
+              <div style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                background: 'rgba(0,0,0,0.7)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'white',
+                fontSize: '16px'
+              }}>
+                Starting camera...
+              </div>
+            )}
           </div>
-          <button className="button secondary" onClick={() => {
-            stopCamera();
-            setIsScanning(false);
-          }}>
+          <p className="info-text">
+            {scannerReady
+              ? 'Point your camera at the QR code'
+              : 'Please allow camera access when prompted'}
+          </p>
+          <button className="button secondary" onClick={stopScanner}>
             Cancel
           </button>
         </div>
@@ -405,7 +542,7 @@ function App() {
             placeholder="Enter message"
             value={messageInput}
             onChange={(e) => setMessageInput(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+            onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
           />
           <button className="button" onClick={handleSendMessage}>
             Send Message

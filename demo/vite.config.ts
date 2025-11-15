@@ -6,7 +6,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
-    host: true
+    host: true,
+    allowedHosts: ['localhost', '127.0.0.1', '0.0.0.0', 'deggen.ngrok.app']
   },
   resolve: {
     alias: {
@@ -15,5 +16,8 @@ export default defineConfig({
   },
   optimizeDeps: {
     exclude: ['webrtpay']
+  },
+  worker: {
+    format: 'es'
   }
 });
