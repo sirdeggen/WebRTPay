@@ -32,7 +32,7 @@ WebRTPay includes a Docker Compose setup for running a local TURN server:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/webrtpay.git
+git clone https://github.com/sirdeggen/webrtpay.git
 cd webrtpay
 
 # Start TURN server and demo
@@ -474,6 +474,4 @@ Contributions welcome! Please read CONTRIBUTING.md for guidelines.
 
 ## Support
 
-- GitHub Issues: https://github.com/yourusername/webrtpay/issues
-- Documentation: https://webrtpay.dev
-- Discord: https://discord.gg/webrtpay
+- GitHub Issues: https://github.com/sirdeggen/webrtpay/issues
