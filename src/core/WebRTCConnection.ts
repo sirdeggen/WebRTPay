@@ -54,12 +54,13 @@ export class WebRTCConnection {
 
   /**
    * Filter problematic SDP attributes for cross-browser compatibility
+   * Note: We keep a=sctp-port: because it's required for data channel negotiation
    */
   private filterSDP(sdp: string): string {
     return sdp
       .split('\n')
       .filter(line => !line.startsWith('a=max-message-size:'))
-      .filter(line => !line.startsWith('a=sctp-port:'))
+      // Do NOT filter a=sctp-port: - it's required for data channels!
       .join('\n');
   }
 
@@ -145,24 +146,30 @@ export class WebRTCConnection {
     // Handle ICE candidate events
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log(`[ICE] New candidate (${this.role}):`, event.candidate.candidate);
         this.iceCandidatesBuffer.push(event.candidate);
         this.emit(ConnectionEvent.ICE_CANDIDATE, { candidate: event.candidate });
 
         // In trickle ICE mode, send candidates through data channel as they arrive
         if (this.trickleIceEnabled && this.dataChannel && this.dataChannel.readyState === 'open') {
+          console.log('[ICE] Sending candidate through data channel');
           this.sendIceCandidateThroughDataChannel(event.candidate);
         } else if (this.trickleIceEnabled) {
           // Queue candidate to send when data channel opens
+          console.log('[ICE] Queuing candidate for later (data channel not open yet)');
           this.pendingIceCandidates.push(event.candidate.toJSON());
         }
+      } else {
+        console.log(`[ICE] Gathering complete (${this.role})`);
       }
     };
 
     // Handle connection state changes
     pc.onconnectionstatechange = () => {
-      console.log('Connection state:', pc.connectionState);
+      console.log(`[PEER CONNECTION] State changed to: ${pc.connectionState} (role: ${this.role})`);
       switch (pc.connectionState) {
         case 'connected':
+          console.log(`[PEER CONNECTION] Successfully connected! (role: ${this.role})`);
           this.setState(ConnectionState.CONNECTED);
           break;
         case 'disconnected':
@@ -198,6 +205,9 @@ export class WebRTCConnection {
 
     // Handle incoming data channels (answerer side)
     pc.ondatachannel = (event) => {
+      console.log(`[DATA CHANNEL] Received data channel from peer (role: ${this.role})`);
+      console.log(`[DATA CHANNEL] Channel label: ${event.channel.label}`);
+      console.log(`[DATA CHANNEL] Channel state: ${event.channel.readyState}`);
       this.setupDataChannel(event.channel);
     };
 
@@ -212,12 +222,26 @@ export class WebRTCConnection {
     this.dataChannel = channel;
 
     channel.onopen = () => {
-      console.log('Data channel opened');
+      console.log(`[DATA CHANNEL] Opened (role: ${this.role}, trickle ICE: ${this.trickleIceEnabled})`);
       this.emit(ConnectionEvent.DATA_CHANNEL_OPEN, { channel });
 
       // If we're the answerer in trickle ICE mode, send answer through data channel
       if (this.trickleIceEnabled && this.role === ConnectionRole.ANSWERER && this.peerConnection) {
+        console.log('[DATA CHANNEL] Answerer sending answer through data channel');
         this.sendAnswerThroughDataChannel();
+      }
+
+      // Send any pending ICE candidates
+      if (this.trickleIceEnabled && this.pendingIceCandidates.length > 0) {
+        console.log(`[DATA CHANNEL] Sending ${this.pendingIceCandidates.length} pending ICE candidates`);
+        for (const candidate of this.pendingIceCandidates) {
+          this.dataChannel!.send(JSON.stringify({
+            __signaling: true,
+            type: 'ice-candidate',
+            candidate
+          }));
+        }
+        this.pendingIceCandidates = [];
       }
     };
 
@@ -282,10 +306,12 @@ export class WebRTCConnection {
       const pc = this.initializePeerConnection();
 
       // Create data channel (offerer creates it)
+      console.log('[DATA CHANNEL] Creating data channel as offerer');
       const channel = pc.createDataChannel('payment-channel', {
         ordered: true,
         maxRetransmits: 3
       });
+      console.log(`[DATA CHANNEL] Created channel with state: ${channel.readyState}`);
       this.setupDataChannel(channel);
 
       // Create offer
@@ -294,6 +320,10 @@ export class WebRTCConnection {
 
       // Filter problematic SDP attributes for compatibility
       const cleanSDP = this.filterSDP(offer.sdp || '');
+
+      // Log SDP to verify data channel is included
+      console.log('[SDP] Offer SDP contains data channel:', cleanSDP.includes('m=application'));
+      console.log('[SDP] Offer SDP contains SCTP:', cleanSDP.includes('sctp-port'));
 
       if (useTrickleICE) {
         // In trickle ICE mode, wait for at least one ICE candidate
@@ -359,28 +389,26 @@ export class WebRTCConnection {
     return new Promise((resolve) => {
       // If we already have a candidate, resolve immediately
       if (this.iceCandidatesBuffer.length > 0) {
+        console.log(`[ICE] Already have ${this.iceCandidatesBuffer.length} candidate(s), resolving immediately`);
         resolve();
         return;
       }
 
+      console.log('[ICE] Waiting for initial ICE candidate...');
       const timer = setTimeout(() => {
+        console.log('[ICE] Timeout waiting for candidates, continuing anyway');
         resolve(); // Continue anyway after timeout
       }, timeout);
 
-      // Wait for first candidate
-      const originalHandler = pc.onicecandidate;
-      const candidateHandler = (event: RTCPeerConnectionIceEvent) => {
-        if (originalHandler) {
-          originalHandler.call(pc, event);
-        }
+      // Check periodically for candidates (since handler is already set up)
+      const checkInterval = setInterval(() => {
         if (this.iceCandidatesBuffer.length > 0) {
+          console.log(`[ICE] Got ${this.iceCandidatesBuffer.length} candidate(s)`);
           clearTimeout(timer);
-          pc.onicecandidate = originalHandler;
+          clearInterval(checkInterval);
           resolve();
         }
-      };
-
-      pc.onicecandidate = candidateHandler;
+      }, 100);
     });
   }
 
@@ -436,6 +464,8 @@ export class WebRTCConnection {
       const pc = this.initializePeerConnection();
 
       // Set remote description from offer
+      console.log('[SDP] Received offer SDP contains data channel:', token.offer.sdp?.includes('m=application'));
+      console.log('[SDP] Received offer SDP contains SCTP:', token.offer.sdp?.includes('sctp-port'));
       await pc.setRemoteDescription(new RTCSessionDescription(token.offer));
 
       // Add ICE candidates if provided (traditional mode)
@@ -554,26 +584,29 @@ export class WebRTCConnection {
    * Handle signaling messages received through data channel
    */
   private async handleSignalingMessage(message: any): Promise<void> {
-    console.log('Received signaling message:', message.type);
+    console.log(`[SIGNALING] Received message type: ${message.type} (role: ${this.role})`);
 
     try {
       if (message.type === 'answer') {
         // Offerer receives answer from answerer
+        console.log('[SIGNALING] Setting remote answer from data channel');
         await this.peerConnection?.setRemoteDescription(
           new RTCSessionDescription(message.answer)
         );
-        console.log('Remote answer set');
+        console.log('[SIGNALING] Remote answer set successfully');
+        this.setState(ConnectionState.CONNECTING);
       } else if (message.type === 'ice-candidate') {
         // Received ICE candidate
         if (message.candidate && this.peerConnection) {
+          console.log('[SIGNALING] Adding remote ICE candidate:', message.candidate.candidate);
           await this.peerConnection.addIceCandidate(
             new RTCIceCandidate(message.candidate)
           );
-          console.log('Remote ICE candidate added');
+          console.log('[SIGNALING] Remote ICE candidate added');
         }
       }
     } catch (error) {
-      console.error('Failed to handle signaling message:', error);
+      console.error('[SIGNALING] Failed to handle signaling message:', error);
       this.emit(ConnectionEvent.ERROR, {
         error: new WebRTPayError(
           ErrorType.CONNECTION_FAILED,

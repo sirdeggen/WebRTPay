@@ -32,6 +32,8 @@ function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [scannerReady, setScannerReady] = useState(false);
   const [stats, setStats] = useState({ sent: 0, received: 0 });
+  const [tokenJson, setTokenJson] = useState<string>('');
+  const [pasteInput, setPasteInput] = useState<string>('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<any>(null);
@@ -84,16 +86,17 @@ function App() {
       setError('');
       const mgr = initializeManager();
 
-      // Use traditional two QR code mode (false = no trickle ICE)
-      const { qrCodeDataUrl, token, isTrickleICE } = await mgr.createQRConnection(false);
+      // Use trickle ICE mode (single QR code with answer via data channel)
+      const { qrCodeDataUrl, token, isTrickleICE } = await mgr.createQRConnection(true);
       setQrCodeUrl(qrCodeDataUrl);
-      setWaitingForAnswer(true); // Always wait for answer in traditional mode
+      setTokenJson(JSON.stringify(token));
+      // In trickle ICE mode, no need to wait for answer QR code
 
       // Log payload size for debugging
       const payloadSize = QRBootstrap.estimatePayloadSize(token);
       console.log(`QR code payload size: ${payloadSize} bytes (${(payloadSize / 1024).toFixed(2)} KB)`);
       console.log(`ICE candidates included: ${token.iceCandidates?.length || 0}`);
-      console.log(`Traditional mode (two QR codes): ${!isTrickleICE}`);
+      console.log(`Trickle ICE mode (single QR code): ${isTrickleICE}`);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -103,6 +106,38 @@ function App() {
   const handleStartScan = () => {
     setError('');
     setIsScanning(true);
+  };
+
+  // Copy token JSON to clipboard
+  const handleCopyToken = async () => {
+    try {
+      await navigator.clipboard.writeText(tokenJson);
+      alert('Token copied to clipboard!');
+    } catch (err) {
+      console.error('Failed to copy:', err);
+      setError('Failed to copy to clipboard');
+    }
+  };
+
+  // Connect using pasted token JSON
+  const handlePasteConnect = async () => {
+    try {
+      setError('');
+      const token = JSON.parse(pasteInput);
+      const mgr = manager || initializeManager();
+      const result = await mgr.joinQRConnection(token);
+
+      if (result.isTrickleICE) {
+        console.log('>>> Trickle ICE mode: answer will be sent via data channel');
+      } else if (result.answerQRCode) {
+        console.log('>>> Traditional mode: showing answer QR code');
+        setAnswerQRCodeUrl(result.answerQRCode);
+      }
+      setPasteInput('');
+    } catch (err) {
+      console.error('Failed to connect with pasted token:', err);
+      setError((err as Error).message);
+    }
   };
 
   // Start scanning answer QR code (Step 3: Offerer scans answer QR)
@@ -164,9 +199,12 @@ function App() {
                 const mgr = manager || initializeManager();
                 const result = await mgr.joinQRConnection(data);
 
-                // Always show answer QR code in traditional mode
-                console.log('>>> Showing answer QR code');
-                if (result.answerQRCode) {
+                // Check if this is trickle ICE or traditional mode
+                if (result.isTrickleICE) {
+                  console.log('>>> Trickle ICE mode: answer will be sent via data channel');
+                  // No QR code to show - answer sent through data channel
+                } else if (result.answerQRCode) {
+                  console.log('>>> Traditional mode: showing answer QR code');
                   setAnswerQRCodeUrl(result.answerQRCode);
                 } else {
                   setError('Failed to generate answer QR code');
@@ -397,11 +435,35 @@ function App() {
                 {method === 'qr' ? (
                   <>
                     <p className="info-text">
-                      Scan a QR code from another device
+                      Scan a QR code from another device or paste token JSON
                     </p>
                     <button className="button" onClick={handleStartScan}>
                       Start Camera
                     </button>
+                    <div style={{ marginTop: '20px', borderTop: '1px solid #ccc', paddingTop: '20px' }}>
+                      <p className="info-text" style={{ marginBottom: '10px' }}>
+                        Or paste token JSON:
+                      </p>
+                      <textarea
+                        className="input"
+                        placeholder="Paste token JSON here..."
+                        value={pasteInput}
+                        onChange={(e) => setPasteInput(e.target.value)}
+                        style={{
+                          minHeight: '80px',
+                          fontFamily: 'monospace',
+                          fontSize: '12px',
+                          marginBottom: '10px'
+                        }}
+                      />
+                      <button
+                        className="button"
+                        onClick={handlePasteConnect}
+                        disabled={!pasteInput.trim()}
+                      >
+                        Connect with Pasted Token
+                      </button>
+                    </div>
                   </>
                 ) : (
                   <>
@@ -442,12 +504,24 @@ function App() {
               Have the other device scan this code
             </p>
           </div>
-          <p className="info-text">
-            After they scan, they'll show you a QR code. Click below when ready to scan it.
-          </p>
-          <button className="button" onClick={handleScanAnswer}>
-            Scan Their Answer QR Code
+          <button className="button secondary" onClick={handleCopyToken}>
+            Copy Token JSON
           </button>
+          <details style={{ marginTop: '10px' }}>
+            <summary style={{ cursor: 'pointer', padding: '5px' }}>Show Token JSON</summary>
+            <textarea
+              readOnly
+              value={tokenJson}
+              style={{
+                width: '100%',
+                minHeight: '100px',
+                fontFamily: 'monospace',
+                fontSize: '10px',
+                marginTop: '10px',
+                padding: '8px'
+              }}
+            />
+          </details>
         </div>
       )}
 
